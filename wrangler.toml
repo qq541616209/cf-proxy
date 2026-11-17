@@ -5,7 +5,13 @@ compatibility_date = "2024-01-01"
 # Workers 配置
 workers_dev = true
 
+[[durable_objects.bindings]]
+name = "OPENAI_PROXY"
+class_name = "OpenAIProxy"
 
+[[migrations]]
+tag = "v1-openai-proxy"
+new_sqlite_classes = ["OpenAIProxy"]
 # 路由配置说明：
 # 推荐在 Cloudflare Dashboard 中配置自定义域名和路由
 # 这样 fork 后无需修改任何配置文件
