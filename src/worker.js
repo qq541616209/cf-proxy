@@ -1,6 +1,6 @@
 /**
  * Cloudflare Workers 反向代理 - 简洁版本
- * 专注于核心代理功能，无特殊API映射
+ * OpenAI API 请求由美国 Durable Object 转发
  */
 
 // ============================================
@@ -33,28 +33,28 @@ export default {
 
       // 基础代理路由（注意：更长的路径要先匹配，避免被短路径提前匹配）
       if (pathname.startsWith('/httpproxyport/')) {
-        return await handleProxyPort(request, pathname, 'http');
+        return await handleProxyPort(request, pathname, 'http', env);
       }
 
       if (pathname.startsWith('/proxyport/')) {
-        return await handleProxyPort(request, pathname, 'https');
+        return await handleProxyPort(request, pathname, 'https', env);
       }
 
       if (pathname.startsWith('/httpproxy/')) {
-        return await handleProxy(request, pathname, 'http');
+        return await handleProxy(request, pathname, 'http', env);
       }
 
       if (pathname.startsWith('/proxy/')) {
-        return await handleProxy(request, pathname, 'https');
+        return await handleProxy(request, pathname, 'https', env);
       }
 
       // HTML重写代理路由
       if (pathname.startsWith('/webproxy/')) {
-        return await handleWebProxy(request, pathname, 'https');
+        return await handleWebProxy(request, pathname, 'https', env);
       }
 
       if (pathname.startsWith('/httpwebproxy/')) {
-        return await handleWebProxy(request, pathname, 'http');
+        return await handleWebProxy(request, pathname, 'http', env);
       }
 
       // 未匹配到任何路由
@@ -69,7 +69,7 @@ export default {
 /**
  * 处理基础代理
  */
-async function handleProxy(request, pathname, protocol) {
+async function handleProxy(request, pathname, protocol, env) {
   const prefix = protocol === 'https' ? '/proxy/' : '/httpproxy/';
   const path = pathname.substring(prefix.length);
   const parts = path.split('/');
@@ -83,13 +83,13 @@ async function handleProxy(request, pathname, protocol) {
   const url = new URL(request.url);
   const targetUrl = `${protocol}://${host}/${targetPath}${url.search}`;
 
-  return await proxyRequest(request, targetUrl);
+  return await proxyRequest(request, targetUrl, env);
 }
 
 /**
  * 处理HTML重写代理
  */
-async function handleWebProxy(request, pathname, protocol) {
+async function handleWebProxy(request, pathname, protocol, env) {
   const prefix = protocol === 'https' ? '/webproxy/' : '/httpwebproxy/';
   const path = pathname.substring(prefix.length);
   const parts = path.split('/');
@@ -103,13 +103,13 @@ async function handleWebProxy(request, pathname, protocol) {
   const url = new URL(request.url);
   const targetUrl = `${protocol}://${host}/${targetPath}${url.search}`;
 
-  return await proxyRequestWithRewrite(request, targetUrl, url.origin, prefix);
+  return await proxyRequestWithRewrite(request, targetUrl, url.origin, prefix, env);
 }
 
 /**
  * 处理带端口代理
  */
-async function handleProxyPort(request, pathname, protocol) {
+async function handleProxyPort(request, pathname, protocol, env) {
   const prefix = protocol === 'https' ? '/proxyport/' : '/httpproxyport/';
   const path = pathname.substring(prefix.length);
   const parts = path.split('/');
@@ -137,7 +137,7 @@ async function handleProxyPort(request, pathname, protocol) {
   console.log(`Host: ${host}, Port: ${portNum}, Path: ${targetPath}`);
 
   try {
-    return await proxyRequest(request, targetUrl);
+    return await proxyRequest(request, targetUrl, env);
   } catch (error) {
     console.error(`Proxy error for ${targetUrl}:`, error);
     return createErrorResponse('Proxy Error', 502, `Failed to connect to ${host}:${portNum} - ${error.message}`);
@@ -147,16 +147,9 @@ async function handleProxyPort(request, pathname, protocol) {
 /**
  * HTTP/HTTPS代理请求（带HTML重写）
  */
-async function proxyRequestWithRewrite(request, targetUrl, proxyOrigin, proxyPrefix) {
+async function proxyRequestWithRewrite(request, targetUrl, proxyOrigin, proxyPrefix, env) {
   try {
-    const headers = buildProxyHeaders(request.headers, targetUrl);
-    const proxyRequest = new Request(targetUrl, {
-      method: request.method,
-      headers: headers,
-      body: request.method !== 'GET' && request.method !== 'HEAD' ? request.body : null
-    });
-
-    const response = await fetch(proxyRequest);
+    const response = await fetchUpstream(request, targetUrl, env);
     const contentType = response.headers.get('content-type') || '';
 
     // 只重写HTML内容
@@ -192,24 +185,11 @@ async function proxyRequestWithRewrite(request, targetUrl, proxyOrigin, proxyPre
 /**
  * HTTP/HTTPS代理请求
  */
-async function proxyRequest(request, targetUrl) {
+async function proxyRequest(request, targetUrl, env) {
   try {
-    // 构建请求头
-    const headers = buildProxyHeaders(request.headers, targetUrl);
-
     // 添加调试日志
     console.log(`Target URL: ${targetUrl}`);
-    console.log(`Host Header: ${headers.get('Host')}`);
-
-    // 构建代理请求
-    const proxyRequest = new Request(targetUrl, {
-      method: request.method,
-      headers: headers,
-      body: request.method !== 'GET' && request.method !== 'HEAD' ? request.body : null
-    });
-
-    // 发送请求并获取响应
-    const response = await fetch(proxyRequest);
+    const response = await fetchUpstream(request, targetUrl, env);
 
     console.log(`Response Status: ${response.status}`);
     console.log(`Response Server: ${response.headers.get('Server')}`);
@@ -228,6 +208,37 @@ async function proxyRequest(request, targetUrl) {
 
   } catch (error) {
     return createErrorResponse('Proxy Error', 502, `Failed to connect to target: ${error.message}`);
+  }
+}
+
+/**
+ * 所有代理路由都在这里选择上游，保留请求体的流式传输。
+ */
+function fetchUpstream(request, targetUrl, env) {
+  const upstream = new Request(targetUrl, {
+    method: request.method,
+    headers: buildProxyHeaders(request.headers, targetUrl),
+    body: request.method !== 'GET' && request.method !== 'HEAD' ? request.body : null
+  });
+  if (!isOpenAIHost(upstream.url)) {
+    return fetch(upstream);
+  }
+
+  const us = env.OPENAI_PROXY.jurisdiction('us');
+  const id = us.idFromName('openai');
+  return us.get(id, { locationHint: 'enam' }).fetch(upstream);
+}
+
+function isOpenAIHost(url) {
+  return new URL(url).hostname.replace(/\.$/, '') === 'api.openai.com';
+}
+
+export class OpenAIProxy {
+  fetch(request) {
+    if (!isOpenAIHost(request.url)) {
+      return new Response('Unsupported upstream', { status: 400 });
+    }
+    return fetch(request);
   }
 }
 
